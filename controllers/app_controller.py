@@ -17,15 +17,16 @@ class CryptoAppController:
         self.visualizer = CryptoVisualizer()
 
     def setup_page(self):
-        st.set_page_config(page_title="Crypto Analysis App", layout="wide")
+        # Removed st.set_page_config() from here since it's already set in main.py
+        pass
 
     def display_sidebar(self):
         st.sidebar.title("How to Use")
         st.sidebar.info(
             """
-            1. Select your desired analysis date range.
-            2. Select a cryptocurrency from the dropdown.
-            3. Choose the analysis type and parameters.
+            1. Select a cryptocurrency from the dropdown.
+            2. Choose the analysis type and parameters.
+            3. Select your desired analysis date range.
             4. View the resulting chart(s) on the main page.
             """
         )
@@ -90,7 +91,7 @@ class CryptoAppController:
                 st.pyplot(fig)
 
     def run(self):
-        self.setup_page()
+        self.setup_page()  # This is now a placeholder.
         self.display_sidebar()
         start_date, end_date = self.get_date_range()
         if start_date is None or end_date is None:
