@@ -8,9 +8,11 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.12"
 pandas = "^2.2.3"
-numpy = "^2.2.4"
+numpy = ">=1.26.0,<2.2.0"
 matplotlib = "^3.10.1"
 streamlit = "^1.44.1"
+scikit-learn = "^1.6.1"
+tensorflow = "^2.19.0"
 
 
 [build-system]
