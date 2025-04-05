@@ -6,28 +6,36 @@ from datetime import date, timedelta
 from tensorflow.keras.models import load_model
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
+from config import DEFAULT_CRYPTO_SYMBOLS
 from utils.data_fetcher import DataFetcher
+import os
 
 
 class PredictionController:
     """
-    Controller for BTC price prediction using a pre-trained LSTM model.
-    Compares predicted prices with actual prices and forecasts future prices.
+    Controller for crypto price prediction using a pre-trained LSTM model.
+    Allows coin selection similar to analysis mode.
     """
 
     def __init__(self):
         self.fetcher = DataFetcher()
-        self.model_path = "models/btc_lstm_model.h5"
-        self.model = load_model(self.model_path)
         self.sequence_length = 60
         self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.model = None  # Model will be loaded based on selected coin
+
+    def load_model_for_coin(self, coin: str):
+        model_path = f"models/{coin}_lstm_model.h5"
+        if not os.path.exists(model_path):
+            st.error(f"Model for {coin} not found. Please train the model first.")
+            return None
+        self.model = load_model(model_path)
+        return self.model
 
     def prepare_data(self, data):
         """
         Prepares data by scaling and creating sequences for prediction.
         """
         dataset = data['Close'].values.reshape(-1, 1)
-        # Fit scaler on the dataset (for demonstration purposes)
         scaled_data = self.scaler.fit_transform(dataset)
         sequences = []
         actual_prices = []
@@ -60,7 +68,6 @@ class PredictionController:
         for _ in range(forecast_days):
             pred = self.model.predict(current_sequence.reshape(1, self.sequence_length, 1))
             forecast.append(pred[0, 0])
-            # Update the sequence: remove the first value and add the prediction
             current_sequence = np.append(current_sequence[1:], [[pred[0, 0]]], axis=0)
         forecast = self.scaler.inverse_transform(np.array(forecast).reshape(-1, 1))
         return forecast
@@ -73,7 +80,7 @@ class PredictionController:
         dates = pd.to_datetime(data['Date'].iloc[self.sequence_length:])
         ax.plot(dates, actual, label='Actual Price')
         ax.plot(dates, predicted, label='Predicted Price')
-        ax.set_title("BTC Price Prediction vs Actual")
+        ax.set_title("Price Prediction vs Actual")
         ax.set_xlabel("Date")
         ax.set_ylabel("Price")
         ax.legend()
@@ -88,7 +95,7 @@ class PredictionController:
         last_date = pd.to_datetime(data['Date'].iloc[-1])
         future_dates = [last_date + timedelta(days=i + 1) for i in range(len(forecast))]
         ax.plot(future_dates, forecast, marker='o', label='Forecasted Price')
-        ax.set_title("BTC Future Price Forecast")
+        ax.set_title("Future Price Forecast")
         ax.set_xlabel("Date")
         ax.set_ylabel("Price")
         ax.legend()
@@ -96,11 +103,17 @@ class PredictionController:
         st.pyplot(fig)
 
     def run(self):
-        # Removed st.set_page_config() from here since it's already set in main.py
-        st.sidebar.title("BTC Price Prediction")
+        st.sidebar.title("Crypto Price Prediction")
         st.sidebar.info("Select a historical date range for prediction and optionally forecast future days.")
 
-        # Date range selection for historical data
+        # Coin selection (user can select from the coin list)
+        coin = st.sidebar.selectbox("Select Cryptocurrency", DEFAULT_CRYPTO_SYMBOLS)
+
+        # Load model for the selected coin
+        if self.load_model_for_coin(coin) is None:
+            return
+
+        # Historical data range selection
         st.sidebar.subheader("Select Historical Data Range")
         default_end = date.today()
         default_start = default_end - timedelta(days=365)  # One year of data
@@ -125,10 +138,10 @@ class PredictionController:
         # Number of days to forecast (optional)
         forecast_days = st.sidebar.number_input("Number of days to forecast", min_value=0, max_value=30, value=0)
 
-        st.title("BTC Price Prediction vs Actual")
-        # Fetch BTC data (using the provided date range)
-        data = self.fetcher.get_crypto_data(symbol="BTC", start_date=start_date, end_date=end_date)
-        st.write(f"Displaying BTC data from **{start_date}** to **{end_date}**:")
+        st.title(f"{coin} Price Prediction vs Actual")
+        # Fetch coin data using the provided date range
+        data = self.fetcher.get_crypto_data(symbol=coin, start_date=start_date, end_date=end_date)
+        st.write(f"Displaying {coin} data from **{start_date}** to **{end_date}**:")
         st.dataframe(data)
 
         # Historical predictions
