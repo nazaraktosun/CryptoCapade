@@ -10,11 +10,11 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 
 
-def download_btc_data(period="5y"):
+def download_crypto_data(symbol: str, period="5y"):
     """
-    Download historical BTC-USD data using yfinance.
+    Download historical crypto data for the given symbol using yfinance.
     """
-    ticker = "BTC-USD"
+    ticker = f"{symbol}-USD"
     data = yf.download(ticker, period=period, progress=False)
     data.reset_index(inplace=True)
     return data[['Date', 'Close']]
@@ -22,7 +22,7 @@ def download_btc_data(period="5y"):
 
 def preprocess_data(data, sequence_length=60):
     """
-    Preprocess the data: scale the closing prices and create sequences.
+    Preprocess the data: scale closing prices and create time-series sequences.
     """
     scaler = MinMaxScaler(feature_range=(0, 1))
     dataset = data['Close'].values.reshape(-1, 1)
@@ -54,15 +54,14 @@ def build_lstm_model(input_shape):
     return model
 
 
-def train_and_save_model():
+def train_and_save_model(symbol: str, period="5y", sequence_length=60):
     """
-    Train the LSTM model on BTC data and save it to the models folder.
+    Train the LSTM model on crypto data for the specified symbol and save it to the models folder.
     """
-    # Download data (using the last 5 years)
-    data = download_btc_data(period="5y")
+    # Download data for the given coin symbol
+    data = download_crypto_data(symbol, period=period)
 
-    # Preprocess data with a sequence length of 60 days
-    sequence_length = 60
+    # Preprocess data
     X, y, scaler = preprocess_data(data, sequence_length)
 
     # Build the model
@@ -74,14 +73,14 @@ def train_and_save_model():
     # Train the model
     model.fit(X, y, epochs=50, batch_size=32, callbacks=[early_stop], verbose=1)
 
-    # Save the model to the models folder
+    # Save the model to the models folder with coin symbol in filename
     os.makedirs("models", exist_ok=True)
-    model_path = os.path.join("models", "btc_lstm_model.h5")
+    model_path = os.path.join("models", f"{symbol}_lstm_model.h5")
     model.save(model_path)
-    print(f"Model saved to {model_path}")
+    print(f"Model for {symbol} saved to {model_path}")
 
 
 if __name__ == "__main__":
-    print("Starting BTC LSTM model training...")
-    train_and_save_model()
-    print("Training completed.")
+    # Örnek kullanım: Eğitim için coin sembolünü kullanıcıdan alır.
+    symbol = input("Enter the crypto symbol to train (e.g., BTC, ETH, XRP): ").upper()
+    train_and_save_model(symbol)
