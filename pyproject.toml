@@ -4,6 +4,11 @@ version = "0.1.0"
 description = ""
 authors = ["Ahmet Çağatay Savaşlı <cagatay.savasli@ozu.edu.tr>"]
 readme = "README.md"
+packages = [
+    { include = "controllers" },
+    { include = "trainers" },
+    { include = "utils" }
+]
 
 [tool.poetry.dependencies]
 python = "^3.12"
@@ -13,7 +18,7 @@ matplotlib = "^3.10.1"
 streamlit = "^1.44.1"
 scikit-learn = "^1.6.1"
 tensorflow = "^2.19.0"
-
+pandas-ta = "^0.3.14b0"
 
 [build-system]
 requires = ["poetry-core"]
