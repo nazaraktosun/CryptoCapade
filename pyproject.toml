@@ -19,6 +19,9 @@ streamlit = "^1.44.1"
 scikit-learn = "^1.6.1"
 tensorflow = "^2.19.0"
 pandas-ta = "^0.3.14b0"
+requests = "^2.32.3"
+xgboost = "^3.0.0"
+torch = "^2.6.0"
 
 [build-system]
 requires = ["poetry-core"]
