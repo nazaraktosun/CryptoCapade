@@ -1,191 +1,247 @@
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error
-from utils.featureBuilder import FeatureBuilder
-import torch
-import torch.nn as nn 
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-import joblib
+# improved_lstm_pipeline.py
 
+import argparse
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import optuna
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import Dataset, DataLoader
+
+from utils.featureBuilder import FeatureBuilder   # <-- your class
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) Dataset + DataLoader
+# ─────────────────────────────────────────────────────────────────────────────
 class SeqDataset(Dataset):
-    """
-    Wraps data for pytorch. We turn our numpy arrays X shapw [N, seq_len,n_feat] and 
-    y shape(N) into tensors. Turns data into [N,1] so it matches output shape
-    """
-    def __init__(self,X,y):
+    def __init__(self, X, y):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
-        
     def __len__(self):
-        """
-        Allows torch to know hiow many samples are there
-        """
         return len(self.X)
-    
-    def __getitem__(self, index):
-        """
-        retrieves index-th sequence and label. Dataloader uses this to build batches
-        """
-        return self.X[index],self.y[index]
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) Model definition
+# ─────────────────────────────────────────────────────────────────────────────
 class LSTMReg(nn.Module):
-    """
-    n_feat : number of features per time step
-    hidden: size of each LSTM's hidden state
-    layers : how many LSTM layers to stack
-    bidir : if true we use bidirectional LSTM reads the sequence forward and backward. Bidirectional means tqo LSTM runs in parallel 
-    one left to right one right to left Outputs gets concatenated, si we pature patterns that might depend on future as well as past context. 
-    """
-    def __init__(self, n_feat , hidden = 64,layers =2,bidir = True):
+    def __init__(self, n_feat, hidden, n_layers, dropout, bidir):
         super().__init__()
-        self.lstm  = nn.LSTM(n_feat, 
-                             hidden,
-                             layers, 
-                             batch_first=True,# data is shaped (batch,seq,feature)
-                            dropout=0.1, # 10% dropout between layers
-                            bidirectional=bidir)
-        
-        self.norm = nn.LayerNorm(hidden*(2 if bidir else 1)) # Normalizes the last hidden output vector per sample to stabilize and speed up training
-        
-        ########### Regression head
-        self.head = nn.Sequential(nn.Dropout(0.2), # random 20% drop for regularization
-                                  nn.Linear(hidden*(2 if bidir else 1),32), #project to 32 dims
-                                  nn.Tanh(), # non linear activation
-                                  nn.Linear(32,1) # final regression output
-                                  )
-        """
-        A small feed forward network on top of the LSTM. Takes the normalized hidden vector
-        shrinks to 32. Applies a tanh and outputs 1 value (predicted log return)
-        """
-        
-    def forward(self,x):
-        """
-        out : Tensor of shape [batc, seq_len;hidden*directions]
-        We ignore hidden cell/states because we jsut want sequence outputs  
-        """
+        self.lstm = nn.LSTM(
+            input_size=n_feat,
+            hidden_size=hidden,
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout if n_layers > 1 else 0.0,
+            bidirectional=bidir
+        )
+        self.norm = nn.LayerNorm(hidden * (2 if bidir else 1))
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden * (2 if bidir else 1), hidden // 2),
+            nn.Tanh(),
+            nn.Linear(hidden // 2, 1)
+        )
+    def forward(self, x):
         out, _ = self.lstm(x)
-        out = self.norm(out[:,-1]) # picks last timestamp for each sequence in the batch all the final hidden features
-        return self.head(out) # pass through MLP head 
-    
-    
-#---------------------- Read csv and build features------------------------
+        last = out[:, -1, :]
+        return self.head(self.norm(last))
 
-
-data = pd.read_csv("/Users/nazaraktosun/CryptoCapade/trainers/sample_data/BTC-USD_data.csv", skiprows=[1])
-data.rename(columns={'Price': 'date'}, inplace=True)
-data['date'] = pd.to_datetime(data['date'], format='%Y-%m-%d', errors='coerce')
-data.set_index('date', inplace=True)
-
-cols_to_convert = ['Open', 'High', 'Low', 'Close', 'Volume']
-for col in cols_to_convert:
-    if data[col].dtype == 'object':
-        data[col] = pd.to_numeric(data[col].str.replace(',', ''), errors='coerce')
-    else:
-        data[col] = pd.to_numeric(data[col], errors='coerce')
-
-data["Log Returns"] = np.log(data["Close"] / data["Close"].shift(1))
-data.replace([np.inf, -np.inf], np.nan, inplace=True)
-data.dropna(subset=["Log Returns"], inplace=True)
-
-fb = FeatureBuilder(data, target_col= 'Log Returns', n_lags=5)
-X,y = fb.get_features_and_target()
-
-SEQ = 10
-X_seq , y_seq = [],[]
-for i in range(SEQ,len(X)):
-    X_seq.append(X.iloc[i-SEQ:i].values)
-    y_seq.append(y.iloc[i])
-
-X_seq,y_seq = np.array(X_seq,np.float32), np.array(y_seq,np.float32)
-
-spl = int(len(X_seq)*0.8)
-
-X_train, X_val = X_seq[:spl], X_seq[spl:]
-y_train,y_val = y_seq[:spl], y_seq[spl:]
-
-scaler = StandardScaler().fit(X_train.reshape(-1,X_train.shape[-1]))
-
-# Reshape X_train to 2D for scaler
-X_train_reshaped = X_train.reshape(-1, X_train.shape[2])
-# Apply scaler
-X_train_scaled = scaler.transform(X_train_reshaped)
-# Reshape back to 3D
-X_train = X_train_scaled.reshape(X_train.shape)
-
-# Repeat for X_val
-X_val_reshaped = X_val.reshape(-1, X_val.shape[2])
-X_val_scaled = scaler.transform(X_val_reshaped)
-X_val = X_val_scaled.reshape(X_val.shape)
-
-joblib.dump(scaler,'scaler.gz')
-
-train_dl = DataLoader(SeqDataset(X_train,y_train),32, shuffle= False)
-val_dl = DataLoader(SeqDataset(X_val,y_val),32,shuffle = False)
-
-#------------------- Train-------------------------
-
-dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = LSTMReg(n_feat= X_train.shape[-1]).to(dev)
-opt = torch.optim.Adam(model.parameters(), lr = 1e-3)
-sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt,factor=.5, patience=4, verbose=True)
-lossf = nn.MSELoss()
-
-best,patience, cnt = np.inf,10,0
-
-for ep in range(1,101):
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) Training + evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+def train_one_epoch(model, loader, opt, loss_fn, device):
     model.train()
-    for xb,yb in train_dl:
-        xb,yb = xb.to(dev) , yb.to(dev)
+    total, count = 0.0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
         opt.zero_grad()
-        loss = lossf(model(xb), yb)
+        loss = loss_fn(model(xb), yb)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(),.5)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        
+        total += loss.item() * xb.size(0)
+        count += xb.size(0)
+    return total / count
+
+def validate(model, loader, loss_fn, device):
     model.eval()
+    total, count = 0.0, 0
+    preds, trues = [], []
     with torch.no_grad():
-        vloss = np.mean([lossf(model(xb.to(dev)), yb.to(dev)).item()
-                for xb, yb in val_dl])
-        
-    sched.step(vloss)
-    
-    print(f"Epoch {ep:03d} | val {vloss:.5e}")
-    
-    if vloss+1e-6 < best:
-        best = vloss; cnt =0
-        torch.save(model.state_dict(), 'best.pt')
-    else:
-        cnt +=1
-        if cnt >= patience:
-            print("Early stop");break
-            
-            
-#==================Evaluation=============================
-model.load_state_dict(torch.load('best.pt'))
-model.eval()    
-with torch.no_grad():
-    preds = model(torch.tensor(X_val).to(dev)).cpu().numpy().flatten()
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            out = model(xb)
+            loss = loss_fn(out, yb)
+            total += loss.item() * xb.size(0)
+            count += xb.size(0)
+            preds.append(out.cpu().numpy())
+            trues.append(yb.cpu().numpy())
+    preds = np.vstack(preds).flatten()
+    trues = np.vstack(trues).flatten()
+    rmse = np.sqrt(mean_squared_error(trues, preds))
+    mae  = mean_absolute_error(trues, preds)
+    dir_acc = (np.sign(preds) == np.sign(trues)).mean()
+    return total / count, rmse, mae, dir_acc, preds, trues
 
-rmse = np.sqrt(mean_squared_error(y_val,preds))
-mae = mean_squared_error(y_val,preds)
-dir_acc = np.mean(np.sign(preds) == np.sign(y_val))
-print(f"\nRMSE {rmse:.3e} | MAE {mae:.3e} | DirAcc {dir_acc:.2%}")
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) Full pipeline for given hyperparameters
+# ─────────────────────────────────────────────────────────────────────────────
+def run_pipeline(args, trial=None):
+    # --- build features
+    df = pd.read_csv(
+        args.data,
+        skiprows=[1,2],
+        parse_dates=['Price'],
+        index_col='Price'
+    )
+    df.index.name = 'date'
+    for c in ['Open','High','Low','Close','Volume']:
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(',',''), errors='coerce')
+    df['Log Returns'] = np.log(df['Close']/df['Close'].shift(1))
+    df.replace([np.inf,-np.inf], np.nan, inplace=True)
+    df.dropna(subset=['Log Returns'], inplace=True)
 
-plt.figure(figsize=(10,4))
-plt.plot(y_val[-150:], label="true")
-plt.plot(preds[-150:], label="pred")
-plt.legend(); plt.tight_layout(); plt.show()
+    fb = FeatureBuilder(df, target_col='Log Returns', n_lags=args.n_lags)
+    X, y = fb.add_lag_features()\
+             .add_rolling_features(window=args.roll_w)\
+             .add_technical_indicators()\
+             .clean()\
+             .get_features_and_target()
+    # --- train/val split
+    seq_len = args.seq_len
+    Xs, ys = [], []
+    for i in range(seq_len, len(X)):
+        Xs.append(X.iloc[i-seq_len:i].values)
+        ys.append(y.iloc[i])
+    Xs, ys = np.array(Xs), np.array(ys)
+    split = int(len(Xs)*0.8)
+    X_train, X_val = Xs[:split], Xs[split:]
+    y_train, y_val = ys[:split], ys[split:]
 
+    # --- scaling
+    scaler = StandardScaler().fit(X_train.reshape(-1, X_train.shape[-1]))
+    joblib.dump(scaler, 'scaler.gz')
+    def scale(arr):
+        flat = arr.reshape(-1, arr.shape[-1])
+        out  = scaler.transform(flat)
+        return out.reshape(arr.shape)
+    X_train, X_val = scale(X_train), scale(X_val)
 
-# ---------------- Next‑day prediction ---------------
-last_block = X.iloc[-SEQ:]
-seq = scaler.transform(last_block.values).reshape(1, SEQ, -1)
-with torch.no_grad():
-    next_ret = model(torch.tensor(seq, dtype=torch.float32).to(dev)).item()
+    # --- DataLoaders
+    train_dl = DataLoader(SeqDataset(X_train,y_train), batch_size=args.bs, shuffle=True)
+    val_dl   = DataLoader(SeqDataset(X_val,y_val), batch_size=args.bs, shuffle=False)
 
-last_close = data["Close"].iloc[-1]
-print(f"\nNext log‑return {next_ret:+.5f}")
-print(f"Predicted next Close ${last_close*np.exp(next_ret):,.2f}")
+    # --- model, optimizer, loss, scheduler
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = LSTMReg(
+        n_feat=X_train.shape[-1],
+        hidden=args.hidden,
+        n_layers=args.layers,
+        dropout=args.dropout,
+        bidir=args.bidir
+    ).to(dev)
+
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5, factor=0.5, verbose=False)
+    loss_fn = nn.HuberLoss() if args.use_huber else nn.MSELoss()
+
+    # --- training loop
+    train_losses, val_losses = [], []
+    for ep in range(1, args.epochs+1):
+        trn = train_one_epoch(model, train_dl, opt, loss_fn, dev)
+        val, rmse, mae, dir_acc, preds, trues = validate(model, val_dl, loss_fn, dev)
+        sched.step(val)
+        train_losses.append(trn)
+        val_losses.append(val)
+
+        if trial:
+            trial.report(val, ep)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
+    # --- if tuning, return val loss
+    if trial:
+        return val_losses[-1]
+
+    # --- otherwise, show metrics & plots
+    print(f"\nFinal val loss: {val_losses[-1]:.5e}")
+    print(f"RMSE {rmse:.3e} | MAE {mae:.3e} | DirAcc {dir_acc:.2%}")
+
+    # plot learning curves
+    plt.figure(figsize=(8,4))
+    plt.plot(train_losses, label='train')
+    plt.plot(val_losses,   label='val')
+    plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend()
+    plt.title('Learning Curves'); plt.tight_layout()
+    plt.savefig('learning_curves.png')
+
+    # residual analysis
+    resid = preds - trues
+    plt.figure(figsize=(8,4))
+    plt.scatter(trues, resid, alpha=0.3)
+    plt.axhline(0, color='k', lw=1)
+    plt.xlabel('True Return'); plt.ylabel('Residual'); plt.title('Residuals vs True')
+    plt.tight_layout()
+    plt.savefig('residuals_scatter.png')
+
+    plt.figure(figsize=(8,4))
+    plt.hist(resid, bins=50, density=True, alpha=0.6)
+    plt.xlabel('Residual'); plt.ylabel('Density'); plt.title('Error Distribution')
+    plt.tight_layout()
+    plt.savefig('residuals_hist.png')
+
+    print("Plots saved: learning_curves.png, residuals_scatter.png, residuals_hist.png")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) Optuna tuning
+# ─────────────────────────────────────────────────────────────────────────────
+def objective(trial):
+    args = argparse.Namespace(
+        data      = global_args.data,
+        n_lags    = trial.suggest_int('n_lags', 3, 10),
+        roll_w    = trial.suggest_int('roll_w', 5, 20),
+        seq_len   = trial.suggest_int('seq_len', 5, 30),
+        hidden    = trial.suggest_categorical('hidden', [32, 64, 128, 256]),
+        layers    = trial.suggest_int('layers', 1, 3),
+        dropout   = trial.suggest_uniform('dropout', 0.0, 0.5),
+        bidir     = trial.suggest_categorical('bidir', [True, False]),
+        lr        = trial.suggest_loguniform('lr', 1e-4, 1e-2),
+        bs        = trial.suggest_categorical('bs', [16, 32, 64]),
+        epochs    = 30,
+        use_huber = trial.suggest_categorical('use_huber', [True, False])
+    )
+    return run_pipeline(args, trial)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data',      type=str, required=True)
+    parser.add_argument('--epochs',    type=int, default=50)
+    parser.add_argument('--n_lags',    type=int, default=5)
+    parser.add_argument('--roll_w',    type=int, default=5)
+    parser.add_argument('--seq_len',   type=int, default=10)
+    parser.add_argument('--hidden',    type=int, default=64)
+    parser.add_argument('--layers',    type=int, default=2)
+    parser.add_argument('--dropout',   type=float, default=0.1)
+    parser.add_argument('--bidir',     type=bool, default=True)
+    parser.add_argument('--lr',        type=float, default=1e-3)
+    parser.add_argument('--bs',        type=int, default=32)
+    parser.add_argument('--use_huber', action='store_true')
+    args = parser.parse_args()
+
+    global_args = args
+    # 5a) run hyperparameter search
+    study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler())
+    study.optimize(objective, n_trials=20, timeout=600)
+
+    print("Best hyperparams:", study.best_params)
+    # 5b) train final on best
+    for k,v in study.best_params.items():
+        setattr(args, k, v)
+    args.epochs = 100
+    run_pipeline(args)
