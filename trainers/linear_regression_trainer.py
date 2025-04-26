@@ -1,36 +1,33 @@
-# trainers/lasso_trainer.py
+# trainers/linear_regression_trainer.py
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import Lasso
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, make_scorer
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import LinearRegression
 
 from utils.featureBuilder import FeatureBuilder
 
-class LassoTrainer:
+class LinearRegressionTrainer:
     """
-    Trainer class for Lasso regression on cryptocurrency log returns using lag features.
+    Trainer class for Linear Regression on cryptocurrency log returns using lag features.
 
     Interface:
       - fit(df): fits model and stores results
       - predict_historical(df): returns actual vs. predicted on test split
       - forecast_future(df, days): returns future log-return forecasts
-      - summary(): returns text summary of best params and metrics
+      - summary(): returns text summary of performance metrics
     """
     def __init__(self,
                  n_lags: int = 5,
-                 alphas: list[float] = [0.001, 0.01, 0.1, 1, 10],
                  n_splits: int = 5,
                  test_size: float = 0.2):
         self.n_lags = n_lags
-        self.alphas = alphas
         self.n_splits = n_splits
         self.test_size = test_size
-        self.best_model = None
-        self.best_params_ = {}
-        self.metrics_ = {}
+        self.model = None
         self.train_index = None
         self.test_index = None
+        self.metrics_ = {}
 
     def fit(self, df: pd.DataFrame):
         # compute log returns and build lag features
@@ -42,21 +39,8 @@ class LassoTrainer:
         fb = FeatureBuilder(data, target_col='Log Returns', n_lags=self.n_lags)
         X, y = fb.get_features_and_target()
 
-        # split for time series CV
+        # time-series split
         tscv = TimeSeriesSplit(n_splits=self.n_splits)
-        mse_scorer = make_scorer(mean_squared_error, greater_is_better=False)
-
-        lasso = Lasso(max_iter=10000)
-        param_grid = {'alpha': self.alphas}
-        grid = GridSearchCV(lasso, param_grid, scoring=mse_scorer,
-                            cv=tscv, n_jobs=-1)
-        grid.fit(X, y)
-
-        # store best
-        self.best_model = grid.best_estimator_
-        self.best_params_ = grid.best_params_
-
-        # evaluate on last split
         splits = list(tscv.split(X))
         train_idx, test_idx = splits[-1]
         self.train_index = train_idx
@@ -65,8 +49,12 @@ class LassoTrainer:
         x_train, x_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-        self.best_model.fit(x_train, y_train)
-        y_pred = self.best_model.predict(x_test)
+        # fit model
+        self.model = LinearRegression()
+        self.model.fit(x_train, y_train)
+
+        # predictions
+        y_pred = self.model.predict(x_test)
 
         # metrics
         self.metrics_['mse'] = mean_squared_error(y_test, y_pred)
@@ -86,7 +74,7 @@ class LassoTrainer:
         X, y = fb.get_features_and_target()
 
         actual = y.iloc[self.test_index].values
-        predicted = self.best_model.predict(X.iloc[self.test_index])
+        predicted = self.model.predict(X.iloc[self.test_index])
         return actual, predicted
 
     def forecast_future(self, df: pd.DataFrame, days: int):
@@ -99,19 +87,17 @@ class LassoTrainer:
 
         forecasts = []
         for _ in range(days):
-            # build feature vector from last n_lags of returns
             last = returns[-self.n_lags:]
             X_new = pd.DataFrame([last], columns=[f'lag_{i+1}' for i in range(self.n_lags)])
-            pred = self.best_model.predict(X_new)[0]
+            pred = self.model.predict(X_new)[0]
             forecasts.append(pred)
             returns.append(pred)
         return np.array(forecasts)
 
     def summary(self) -> str:
-        if self.best_model is None:
-            return "Lasso model not yet fit."
+        if self.model is None:
+            return "Linear model not yet fit."
         return (
-            f"alpha={self.best_params_['alpha']}, "
             f"MSE={self.metrics_['mse']:.4f}, "
             f"MAE={self.metrics_['mae']:.4f}, "
             f"R2={self.metrics_['r2']:.4f}"

@@ -65,11 +65,19 @@ class CryptoAppController:
 
     def fetch_data(self, crypto, start_date, end_date):
         try:
-            data = self.fetcher.get_crypto_data(symbol=crypto, start_date=start_date, end_date=end_date)
+            data = self.fetcher.get_crypto_data(
+                symbol=crypto,
+                start_date=start_date,
+                end_date=end_date
+            )
+            # ← insert here so downstream code sees data["Date"]
+            data.reset_index(inplace=True)
+
             return data
         except Exception as e:
             st.error(str(e))
             return None
+
 
     def display_data(self, crypto, start_date, end_date, data):
         st.write(f"Displaying data for **{crypto}** from **{start_date}** to **{end_date}**:")

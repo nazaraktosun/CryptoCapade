@@ -9,16 +9,21 @@ from controllers.prediction_controller import PredictionController
 
 
 def main():
+    # Mode selection in the sidebar
     st.sidebar.title("Select Mode")
-    mode = st.sidebar.radio("Which analysis do you want to perform?", options=["Analysis", "Prediction"])
+    # Added 'Model Training & Prediction' as a combined mode
+    mode = st.sidebar.radio("Which analysis do you want to perform?", options=["Analysis", "Model Training & Prediction"])
 
     if mode == "Analysis":
         app_controller = CryptoAppController()
         app_controller.run()
-    elif mode == "Prediction":
+    elif mode == "Model Training & Prediction":
+        # PredictionController will now handle both training and prediction
         prediction_controller = PredictionController()
         prediction_controller.run()
 
 
 if __name__ == "__main__":
     main()
+
+
