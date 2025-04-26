@@ -1,10 +1,12 @@
 # trainers/xgboost_trainer.py
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import joblib
 import os
 import sys
+from datetime import datetime, timedelta
 
 # --- Add parent directory to Python path ---
 script_dir = os.path.dirname(__file__)
@@ -13,197 +15,150 @@ if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 # --- End of path modification ---
 
-try:
-    from utils.featureBuilder import FeatureBuilder # Make sure this uses the correct file
-except ModuleNotFoundError:
-    print(f"Error: Could not import FeatureBuilder. Current sys.path: {sys.path}")
-    print(f"Attempted to add parent directory: {parent_dir}")
-    sys.exit(1) # Exit if import fails
-
+from utils.data_fetcher import DataFetcher
+from utils.featureBuilder import FeatureBuilder
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.metrics import make_scorer, mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
 
-# --- Configuration ---
-crypto_symbol = "BTC" # Define the target symbol
-n_lags = 5 # Used by FeatureBuilder's __init__
-n_splits = 5 # Number of splits for time series cross-validation
-output_dir = os.path.join(parent_dir, "trained_models")
+def train_xgboost_model(
+    symbol: str,
+    start_date: datetime,
+    end_date: datetime,
+    n_lags: int = 5,
+    n_splits: int = 5,
+    output_dir: str = "trained_models"
+):
+    """
+    Fetches data via DataFetcher, builds features, trains an XGBoost model,
+    evaluates it, and plots results.
+    """
+    os.makedirs(output_dir, exist_ok=True)
 
-# --- Create output directory if it doesn't exist ---
-os.makedirs(output_dir, exist_ok=True)
+    # 1) Fetch OHLCV + Log Returns
+    fetcher = DataFetcher()
+    data = fetcher.get_crypto_data(
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        compute_log_returns=True,
+        n_lags=n_lags
+    )
+    if data.empty:
+        print("No data returned from DataFetcher.")
+        return
+    print(f"Data head after fetching & cleaning:\n{data.head()}\n")
 
-# --- 1. Load and clean BTC data ---
-try:
-    data_path = os.path.join(script_dir, "sample_data/BTC-USD_data.csv")
-    data = pd.read_csv(data_path, skiprows=[1])
-except FileNotFoundError:
-    print(f"Error: Data file not found at {data_path}")
-    sys.exit(1) # Exit if data is not found
+    # 2) Feature engineering
+    fb = FeatureBuilder(data, target_col='Log Returns', n_lags=n_lags)
+    X, y = fb.get_features_and_target()
+    if X.empty or y.empty:
+        print("No data left after feature engineering.")
+        return
 
-data.rename(columns={'Price': 'date'}, inplace=True)
-data['date'] = pd.to_datetime(data['date'], format='%Y-%m-%d', errors='coerce')
-data.set_index('date', inplace=True)
+    print(f"Features shape: {X.shape}, Target shape: {y.shape}")
 
-cols_to_convert = ['Open', 'High', 'Low', 'Close', 'Volume']
-for col in cols_to_convert:
-    if col in data.columns:
-        if data[col].dtype == 'object':
-            data[col] = pd.to_numeric(data[col].astype(str).str.replace(',', '', regex=False), errors='coerce')
-        else:
-            data[col] = pd.to_numeric(data[col], errors='coerce')
-    else:
-        print(f"Warning: Column '{col}' not found in the data.")
+    # 3) XGBoost with GridSearchCV
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    mse_scorer = make_scorer(mean_squared_error, greater_is_better=False)
 
-data.dropna(subset=['Close', 'Volume'], inplace=True)
+    param_grid = {
+        'n_estimators': [100, 200],
+        'learning_rate': [0.05, 0.1],
+        'max_depth': [3, 5],
+    }
+    xgb = XGBRegressor(
+        objective='reg:squarederror',
+        random_state=42,
+        n_jobs=-1
+    )
+    grid = GridSearchCV(
+        estimator=xgb,
+        param_grid=param_grid,
+        scoring=mse_scorer,
+        cv=tscv,
+        n_jobs=-1,
+        verbose=1
+    )
+    print("Starting XGBoost grid search...")
+    grid.fit(X, y)
+    print("GridSearchCV finished.\n")
 
-# --- 2. Feature Engineering ---
-data["Log Returns"] = np.log(data["Close"] / data["Close"].shift(1))
-data.replace([np.inf, -np.inf], np.nan, inplace=True)
-data.dropna(subset=["Log Returns"], inplace=True)
+    best_model = grid.best_estimator_
+    print(f"Best params: {grid.best_params_}")
+    print(f"Best CV neg. MSE: {grid.best_score_:.6f}\n")
 
-fb = FeatureBuilder(data, target_col='Log Returns', n_lags=n_lags)
-X, y = fb.get_features_and_target()
+    # 4) Final split evaluation
+    train_idx, test_idx = None, None
+    for train_idx, test_idx in tscv.split(X):
+        pass
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-if X.empty or y.empty:
-    print("Error: No data left after feature engineering and cleaning. Check input data and feature logic.")
-    sys.exit(1)
+    y_pred = best_model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2  = r2_score(y_test, y_pred)
+    print("Final Test Set Metrics:")
+    print(f"  MSE: {mse:.6f}")
+    print(f"  MAE: {mae:.6f}")
+    print(f"  R2 : {r2:.6f}\n")
 
-# --- 3. XGBoost Model Training with GridSearchCV ---
-tscv = TimeSeriesSplit(n_splits=n_splits)
-scorer = make_scorer(mean_squared_error, greater_is_better=False)
+    # 5) Save model
+    model_path = os.path.join(output_dir, f"{symbol}_xgb_model.joblib")
+    joblib.dump(best_model, model_path)
+    print(f"Saved model to {model_path}\n")
 
-param_grid = {
-    'n_estimators': [100, 200],
-    'learning_rate': [0.05, 0.1],
-    'max_depth': [3, 5],
-}
+    # 6) Diagnostics: Feature importances
+    fi = best_model.feature_importances_
+    fi_df = pd.DataFrame({
+        'feature': X.columns,
+        'importance': fi
+    }).sort_values('importance', ascending=False).head(15)
+    print("Top 15 feature importances:")
+    print(fi_df)
 
-xgb = XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=-1)
-
-grid_search = GridSearchCV(estimator=xgb,
-                           param_grid=param_grid,
-                           scoring=scorer,
-                           cv=tscv,
-                           n_jobs=-1,
-                           verbose=1)
-
-print("Starting GridSearchCV for XGBoost...")
-grid_search.fit(X, y)
-print("GridSearchCV finished.")
-
-# --- 4. Best Model Extraction and Evaluation ---
-best_xgb_model = grid_search.best_estimator_
-print(f"\nBest parameters found: {grid_search.best_params_}")
-print(f"Best cross-validation score (Negative MSE): {grid_search.best_score_:.6f}")
-
-print("\nEvaluating the best model on the final test split...")
-for train_index, test_index in tscv.split(X):
-    pass # Get the last split
-
-X_train, X_test = X.iloc[train_index], X.iloc[test_index]
-y_train, y_test = y.iloc[train_index], y.iloc[test_index]
-
-y_pred = best_xgb_model.predict(X_test)
-
-mse = mean_squared_error(y_test, y_pred)
-mae = mean_absolute_error(y_test, y_pred)
-r2 = r2_score(y_test, y_pred)
-
-print(f"\nFinal Test Set Performance:")
-print(f" XGBoost MSE: {mse:.6f}")
-print(f" XGBoost MAE: {mae:.6f}")
-print(f" XGBoost R²: {r2:.6f}")
-
-# --- 5. Save the Best Model ---
-model_filename = os.path.join(output_dir, f"{crypto_symbol}_xgboost_model.joblib")
-joblib.dump(best_xgb_model, model_filename)
-print(f"\nSaved the best XGBoost model to {model_filename}")
-
-# --- 6. Diagnostics ---
-
-# 6.1: Baseline Comparison (Naive forecast: predict previous day's return)
-print("\n--- Diagnostics ---")
-# Find the lag_1 feature in X_test which corresponds to the previous day's actual return y_(t-1)
-# Note: Assumes 'lag_1' is the name generated by FeatureBuilder for the 1-period lag of the target
-if 'lag_1' in X_test.columns:
-    y_naive_pred = X_test['lag_1']
-    # Ensure y_naive_pred and y_test align and handle potential NaNs if lag_1 wasn't filled properly
-    valid_indices = y_test.index.intersection(y_naive_pred.dropna().index)
-    y_test_aligned_naive = y_test.loc[valid_indices]
-    y_naive_pred_aligned = y_naive_pred.loc[valid_indices]
-
-    if not y_test_aligned_naive.empty:
-        naive_mse = mean_squared_error(y_test_aligned_naive, y_naive_pred_aligned)
-        naive_mae = mean_absolute_error(y_test_aligned_naive, y_naive_pred_aligned)
-        print("\nBaseline (Naive Lag-1 Forecast):")
-        print(f" Naive MSE: {naive_mse:.6f}")
-        print(f" Naive MAE: {naive_mae:.6f}")
-    else:
-        print("\nCould not compute naive baseline (likely issue aligning lag_1 feature).")
-else:
-    print("\nCould not compute naive baseline ('lag_1' feature not found in X_test).")
-
-# 6.2: Feature Importances
-print("\nFeature Importances (Top 15):")
-try:
-    importances = best_xgb_model.feature_importances_
-    feature_names = X.columns # Get feature names from the original X dataframe
-    feature_importance_df = pd.DataFrame({'feature': feature_names, 'importance': importances})
-    feature_importance_df = feature_importance_df.sort_values(by='importance', ascending=False)
-
-    print(feature_importance_df.head(15))
-
-    # Plot feature importances
-    plt.figure(figsize=(10, 8))
-    plt.barh(feature_importance_df['feature'][:15], feature_importance_df['importance'][:15])
-    plt.xlabel("XGBoost Feature Importance")
-    plt.ylabel("Feature")
-    plt.title("Top 15 Feature Importances")
-    plt.gca().invert_yaxis() # Display most important at the top
+    plt.figure(figsize=(8,6))
+    plt.barh(fi_df['feature'], fi_df['importance'])
+    plt.gca().invert_yaxis()
+    plt.title(f"{symbol} XGBoost Feature Importances")
     plt.tight_layout()
     plt.show()
-except Exception as e:
-    print(f"Could not plot feature importances: {e}")
+
+    # 7) Plot Actual vs Predicted
+    plt.figure(figsize=(12,6))
+    plt.plot(y_test.index, y_test, label='Actual', alpha=0.8)
+    plt.plot(y_test.index, y_pred, label='Predicted', linestyle='--', alpha=0.8)
+    plt.title(f"{symbol} XGBoost: Actual vs Predicted")
+    plt.xlabel('Date')
+    plt.ylabel('Log Return')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 
-# 6.3: Residual Analysis
-print("\nResidual Analysis:")
-residuals = y_test - y_pred
+def main():
+    default_symbol     = "BTC"
+    default_end_date   = datetime.today()
+    default_start_date = default_end_date - timedelta(days=365*2)
+    default_n_lags     = 5
+    default_n_splits   = 5
+    default_output_dir = os.path.join(parent_dir, 'trained_models')
 
-plt.figure(figsize=(12, 6))
-
-# Plot residuals over time
-plt.subplot(1, 2, 1) # 1 row, 2 columns, 1st plot
-plt.plot(y_test.index, residuals, marker='.', linestyle='None', alpha=0.5)
-plt.axhline(0, color='red', linestyle='--')
-plt.title("Residuals vs Time")
-plt.xlabel("Date")
-plt.ylabel("Residual (Actual - Predicted)")
-
-# Plot histogram of residuals
-plt.subplot(1, 2, 2) # 1 row, 2 columns, 2nd plot
-plt.hist(residuals, bins=30, density=True, alpha=0.7)
-residuals.plot(kind='kde', color='red') # Add Kernel Density Estimate
-plt.title("Residual Distribution")
-plt.xlabel("Residual Value")
-plt.ylabel("Density")
-
-plt.tight_layout()
-plt.show()
+    print(
+        f"Running XGBoost trainer for {default_symbol}"
+        f" from {default_start_date:%Y-%m-%d} to {default_end_date:%Y-%m-%d}\n"
+    )
+    train_xgboost_model(
+        symbol=default_symbol,
+        start_date=default_start_date,
+        end_date=default_end_date,
+        n_lags=default_n_lags,
+        n_splits=default_n_splits,
+        output_dir=default_output_dir
+    )
 
 
-# 6.4: Plot Actual vs Predicted (Moved here for better flow after diagnostics)
-plt.figure(figsize=(12, 6))
-plt.plot(y_test.index, y_test, label='Actual Log Return', alpha=0.8)
-plt.plot(y_test.index, y_pred, label='Predicted Log Return (XGBoost)', alpha=0.8, linestyle='--')
-plt.title(f"{crypto_symbol} XGBoost: Actual vs Predicted Log Returns (Final Split)")
-plt.xlabel("Date")
-plt.ylabel("Log Return")
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-
-print("\nXGBoost trainer script finished.")
+if __name__ == "__main__":
+    main()

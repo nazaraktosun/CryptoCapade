@@ -1,120 +1,100 @@
-import pandas as pd
-import numpy as np
+
 import os
 import sys
-import torch
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping,ModelCheckpoint
-from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
-from pytorch_forecasting.data import GroupNormalizer
-from pytorch_forecasting.metrics import QuantileLoss
+from datetime import datetime, timedelta
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import joblib
 import matplotlib.pyplot as plt
-from utils.featureBuilder import FeatureBuilder
-#-----Add parent directory to python path--------
+import numpy as np
+import pandas as pd
+import torch
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
+from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+from pytorch_forecasting.data import GroupNormalizer, NaNLabelEncoder
+from pytorch_forecasting.metrics import QuantileLoss
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Add project root to path
+# ─────────────────────────────────────────────────────────────────────────────
 script_dir = os.path.dirname(__file__)
 parent_dir = os.path.abspath(os.path.join(script_dir, '..'))
 if parent_dir not in sys.path:
     sys.path.append(parent_dir)
-    
-#------Configuration-------
-crypto_symbol = 'BTC'
-max_encoder_length = 60 #How many past days model sees
+
+from utils.data_fetcher import DataFetcher
+from utils.featureBuilder import FeatureBuilder
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+crypto_symbol         = 'BTC'
+max_encoder_length    = 60
 max_prediction_length = 1
-output_dir = os.path.join(parent_dir,'trained_models')
-batch_size = 64 # How many sequences to process in parallel
-n_epochs = 10 # Number of training epochs (start small)
-n_lags = 5 
-#----- Path for saving checkpoints/models------
-output_dir = os.path.join(parent_dir, "trained_models")
-os.makedirs(output_dir,exist_ok=True)
-model_name = f"{crypto_symbol}_tft_model" #Name for checkpoint
+batch_size            = 64
+n_epochs              = 10
+n_lags                = 5
 
+output_dir = os.path.join(parent_dir, 'trained_models')
+model_name = f"{crypto_symbol}_tft"
+os.makedirs(output_dir, exist_ok=True)
 
-print("--- Configuration ---")
-print(f"Crypto Symbol: {crypto_symbol}")
-print(f"Encoder Length: {max_encoder_length}")
-print(f"Prediction Length: {max_prediction_length}")
-print(f"Output Directory: {output_dir}")
-print("---------------------\n")
+print(f"--- Configuration ---\n"
+      f"Symbol: {crypto_symbol}\n"
+      f"Encoder length: {max_encoder_length}\n"
+      f"Prediction length: {max_prediction_length}\n"
+      f"Output dir: {output_dir}\n"
+      f"---------------------\n")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) Fetch & Preprocess Data via DataFetcher (instead of CSV)
+# ─────────────────────────────────────────────────────────────────────────────
+print("Fetching data via DataFetcher...")
+fetcher = DataFetcher()
+df = fetcher.get_crypto_data(
+    symbol=crypto_symbol,
+    start_date=datetime.today() - timedelta(days=365*2),
+    end_date=datetime.today(),
+    compute_log_returns=True,  # we let FeatureBuilder compute log-returns
+    n_lags=n_lags
+)
+if df.empty:
+    raise RuntimeError("No data fetched for TFT training.")
 
-#---------Load and Preprocess Data------
-print("Loading and Preprocessing Data")
-try: 
-    data_path = os.path.join(script_dir,"sample_data/BTC-USD_data.csv")
-    data_raw = pd.read_csv(data_path,skiprows=[1])
-except FileNotFoundError:
-    print(f"Error: Data file not found at {data_path}")
-    sys.exit(1)
-
-data_raw.rename(columns={'Price': 'date'},inplace=True)
-data_raw['date'] = pd.to_datetime(data_raw['date'], format='%Y-%m-%d', errors='coerce')
-data_raw.set_index('date', inplace=True)
-
-cols_to_convert = ['Open', 'High', 'Low', 'Close', 'Volume']
-for col in cols_to_convert:
-    if col in data_raw.columns:
-        if data_raw[col].dtype == 'object':
-            data_raw[col] = pd.to_numeric(data_raw[col].astype(str).str.replace(',', '', regex=False), errors='coerce')
-        else:
-            data_raw[col] = pd.to_numeric(data_raw[col], errors='coerce')
-    else:
-        print(f"Warning: Column '{col}' not found in the data.")
-data_raw.dropna(subset=['Close','Volume'],inplace=True)
-
-#----2. Feature Engineering------
-print("====Feature Engineerong=====")
-data_raw['Log Returns'] = np.log(data_raw["Close"] / data_raw['Close'].shift(1))
-data_raw.replace([np.inf, -np.inf],np.nan,inplace=True)
-data_raw.dropna(subset=["Log Returns"],inplace=True)
-
-#Use feature builder
-#Note that we create features first then add time_idx and group
-#group needed by pytorch-forecasting
-
-fb = FeatureBuilder(data_raw,target_col='Log Returns',n_lags= n_lags)
-#We get all features created by the users feature builder
-#We wont use the X,y split directly here but work with the full df from the builder
-
-data_featured = fb.add_lag_features().add_rolling_features().add_technical_indicators().clean().df
+# 3) Feature engineering
+print("Building features with FeatureBuilder...")
+fb = FeatureBuilder(df, target_col='Log Returns', n_lags=n_lags)
+data_featured = (
+    fb
+    .add_lag_features()
+    .add_rolling_features()
+    .add_technical_indicators()
+    .clean()
+    .df
+)
 
 #---- Prepare DataFrame for TimeSeriesDataSet------
 print("--- Preparing DataFrame for TimeSeriesDataSet ---")
-# torch forecasting needs specific columns:
-# 1. A time index: A continuous integer sequence representing time steps.
-# 2. A target column: What we want to predict ('Log Returns').
-# 3. Group IDs: To distinguish different time series (here, just 'BTC').
-# 4. Features: All other input columns.
 
 #Reset time index if date is the index so we can add time_idx easily 
 if isinstance(data_featured.index, pd.DatetimeIndex):
     data_featured = data_featured.reset_index()
     
-#Add time index
 data_featured['time_idx'] = range(len(data_featured))
 
-#Add group ID
 data_featured['group'] = crypto_symbol
 
-# Add simple time features why we need these for transofrmers 
-# Ensure 'date' column exists after reset_index
 if 'date' in data_featured.columns:
-    data_featured['month'] = data_featured['date'].dt.month.astype(str).astype("category") # Treat as category
-    data_featured['day_of_week'] = data_featured['date'].dt.dayofweek.astype(str).astype("category")
+    data_featured['month'] = data_featured['Date'].dt.month.astype(str).astype("category") # Treat as category
+    data_featured['day_of_week'] = data_featured['Date'].dt.dayofweek.astype(str).astype("category")
 else:
-    print("Warning: 'date' column not found after index reset. Cannot add time features.")
+    print("Warning: 'Date' column not found after index reset. Cannot add time features.")
     data_featured['month'] = 0 # Add dummy if needed later
     data_featured['day_of_week'] = 0
 
 data_featured['Log Returns'] = data_featured['Log Returns'].astype(np.float32)
 
-
-# Identify feature columns (adjust based on FeatureBuilder output)
-# We need to tell TimeSeriesDataSet which features are known/unknown, static/dynamic, real/categorical
-# For simplicity now, let's treat most features from FeatureBuilder as 'unknown reals'
-# These are features whose future values we don't know at prediction time
-#Why we need to say those things 
 
 feature_cols = [col for col in fb.df.columns if col.startswith('lag_') or
                 col.startswith('ma_') or col.startswith('std_') or
@@ -131,15 +111,20 @@ print(data_featured.head())
 print(data_featured.info())
 
 
-# --- Stop Point 1: Data is prepared ---
 print("\n--- Data loading and preparation complete. ---")
-# --- ADD THIS SECTION TO HANDLE POTENTIAL REMAINING NaNs ---
 print("\n--- Final Cleaning Before TimeSeriesDataSet ---")
-# List all columns that TimeSeriesDataSet will actually use
-# Make sure this list is accurate based on the parameters you pass to TimeSeriesDataSet below
+time_varying_known_categoricals = ['month', 'day_of_week']
+# Then use it in the cols_to_check definition
 cols_to_check = (
     ['Log Returns', 'time_idx', 'group'] + # Target, time, group
-    time_varying_known_categoricals + # e.g., ['month', 'day_of_week']
+    time_varying_known_categoricals + # Now this variable is defined
+    ['time_idx'] + # time_varying_known_reals
+    feature_cols + # time_varying_unknown_reals (features from FeatureBuilder)
+    ['Log Returns'] # Target also included in unknown_reals
+)
+cols_to_check = (
+    ['Log Returns', 'time_idx', 'group'] + # Target, time, group
+    time_varying_known_categoricals + 
     ['time_idx'] + # time_varying_known_reals
     feature_cols + # time_varying_unknown_reals (features from FeatureBuilder)
     ['Log Returns'] # Target also included in unknown_reals
@@ -154,62 +139,64 @@ data_featured.dropna(subset=cols_to_check, inplace=True)
 final_rows = len(data_featured)
 print(f"Dropped {initial_rows - final_rows} rows with NaNs in required columns.")
 
-# IMPORTANT: Recreate time_idx after dropping rows to ensure it's contiguous
-data_featured.sort_values('date', inplace=True) # Ensure data is sorted by date first
+data_featured.sort_values('Date', inplace=True) # Ensure data is sorted by date first
 data_featured['time_idx'] = range(len(data_featured))
 print(f"Recreated time_idx. New range: {data_featured['time_idx'].min()} to {data_featured['time_idx'].max()}")
-# --- END OF ADDED SECTION ---
 
-# --- 4. Create TimeSeriesDataSet ---
 print("\n--- Creating TimeSeriesDataSet ---")
 
-# Define the training cutoff point (e.g., use last prediction_length + encoder_length steps for validation)
-# This ensures the validation set is truly "future" data relative to the training set
 validation_cutoff = data_featured["time_idx"].max() - max_prediction_length
 training_cutoff = validation_cutoff - max_encoder_length # Start validation encoder here
-# A simpler split: use ~80% for training
-# training_cutoff = data_featured["time_idx"].quantile(0.8)
+
 
 
 print(f"Data time_idx range: {data_featured['time_idx'].min()} to {data_featured['time_idx'].max()}")
 print(f"Training cutoff (time_idx <= {training_cutoff})")
-# print(f"Validation starts (time_idx > {training_cutoff})") # Use this if using quantile split
+# ---------------------------------------------------------------------------
+# 1. Calendar features (categorical with unknown bucket)  ← you already added
+# ---------------------------------------------------------------------------
+data_featured["month"]      = data_featured["Date"].dt.month.astype("string").astype("category")
+data_featured["day_of_week"] = data_featured["Date"].dt.dayofweek.astype("string").astype("category")
 
+from pytorch_forecasting.data import NaNLabelEncoder
 
-# We need to tell the dataset about the different types of features
-# time_varying_unknown_reals: Features whose future values are unknown at prediction time (most of ours)
-# time_varying_known_reals: Features whose future values ARE known (e.g., time_idx, maybe day/month if predicting far ahead)
-# static_categoricals: Features that don't change over time for a group (e.g., the 'group' column itself)
-# target_normalizer: How to scale the target variable ('Log Returns'). GroupNormalizer is common.
+categorical_encoders = {
+    "month":      NaNLabelEncoder(add_nan=True),
+    "day_of_week": NaNLabelEncoder(add_nan=True),
+}
 
-# Identify categorical time features we added
-time_varying_known_categoricals = [col for col in ['month', 'day_of_week'] if col in data_featured.columns]
+time_varying_known_categoricals = ["month", "day_of_week"]
+time_varying_known_reals        = ["time_idx"]        # only numeric known real
 
+# ---------------------------------------------------------------------------
+# 2. Build the training dataset
+# ---------------------------------------------------------------------------
 training_dataset = TimeSeriesDataSet(
-    data_featured[lambda x: x.time_idx <= training_cutoff], # Data for training
+    data_featured[lambda x: x.time_idx <= training_cutoff],
     time_idx="time_idx",
     target="Log Returns",
     group_ids=["group"],
     max_encoder_length=max_encoder_length,
     max_prediction_length=max_prediction_length,
-    # static_categoricals=["group"], # Use if you have features constant per group
-    time_varying_known_categoricals=time_varying_known_categoricals, # month, day_of_week
-    time_varying_known_reals=["time_idx"], # time_idx is known in the future
-    time_varying_unknown_reals=feature_cols + ["Log Returns"], # Past values of features and target
-    # We include Log Returns also as unknown_reals because the model can use past target values as input features.
-    target_normalizer=GroupNormalizer(groups=["group"], transformation="softplus"), # Normalizes target by group
-    add_relative_time_idx=True, # Adds relative time index automatically
-    add_target_scales=True,     # Adds target scaling information
-    add_encoder_length=True,    # Adds encoder length information
+
+    time_varying_known_categoricals=time_varying_known_categoricals,
+    time_varying_known_reals=time_varying_known_reals,
+    time_varying_unknown_reals=feature_cols,
+
+    categorical_encoders=categorical_encoders,
+
+    target_normalizer=GroupNormalizer(groups=["group"], transformation="softplus"),
+    add_relative_time_idx=True,
+    add_target_scales=True,
+    add_encoder_length=True,
 )
 
-# Create validation dataset: uses data after training cutoff for prediction target,
-# but needs encoder data before the cutoff as input
+
 validation_dataset = TimeSeriesDataSet.from_dataset(
     training_dataset,
     data_featured,
-    predict=True, # Set to predict mode
-    stop_randomization=True # Important for validation
+    predict=True
+    
 )
 
 # Convert datasets to dataloaders for training
@@ -223,8 +210,7 @@ print("--- TimeSeriesDataSet and DataLoaders created ---")
 # --- 5. Define Model & Trainer ---
 print("\n--- Defining Model and Trainer ---")
 
-# Configure PyTorch Lightning Trainer
-# Set default_root_dir to save logs/checkpoints in a specific place
+
 pl.seed_everything(42) # Set seed for reproducibility
 
 # Define callbacks
@@ -241,8 +227,6 @@ checkpoint_callback = ModelCheckpoint(
 
 trainer = pl.Trainer(
     max_epochs=n_epochs,
-    # accelerator="gpu" if torch.cuda.is_available() else "cpu", # Use GPU if available
-    # devices=1, # Number of GPUs/CPUs to use
     gradient_clip_val=0.1, # Helps prevent exploding gradients
     limit_train_batches=50,  # Limit batches per epoch for faster initial run (remove for full training)
     limit_val_batches=20,   # Limit validation batches (remove for full training)
@@ -251,7 +235,6 @@ trainer = pl.Trainer(
     # enable_progress_bar=True, # Set False if running in non-interactive environment
 )
 
-# Define the Temporal Fusion Transformer model
 # Hyperparameters are examples, tuning is needed for optimal performance
 tft = TemporalFusionTransformer.from_dataset(
     training_dataset,
@@ -263,7 +246,6 @@ tft = TemporalFusionTransformer.from_dataset(
     output_size=7,          # Number of output quantiles (for QuantileLoss, 7 is standard)
     loss=QuantileLoss(),    # Loss function for quantile regression (good for uncertainty)
     # loss=MAE(), # Could use MAE for point forecasts
-    # reduce_on_plateau_patience=4, # Optional LR scheduler config
 )
 
 print(f"--- Model Structure ---")
@@ -291,19 +273,15 @@ if best_model_path and os.path.exists(best_model_path):
         print("Best model loaded successfully.")
 
         print("\n--- Generating Predictions on Validation Set ---")
-        # Use the validation dataloader we created earlier
-        # Make predictions (returns predicted values)
+
         predictions = best_tft.predict(val_dataloader, return_index=True, return_decoder_lengths=True)
         # Note: predict returns the point forecast (median for QuantileLoss).
         # For quantiles, use mode="quantiles"
 
         print(f"Predictions generated for {len(predictions.index)} validation time points.")
 
-        # --- Plotting Actual vs Predicted using pytorch-forecasting ---
-        # This method plots the first batch/sequence from the dataloader by default.
-        # It's useful for a quick visual check.
+
         print("\n--- Plotting Example Prediction (First Sequence in Validation Loader) ---")
-        # Get raw predictions for plotting quantiles if using QuantileLoss
         raw_predictions, x_val = best_tft.predict(val_dataloader, mode="raw", return_x=True)
 
         # Plotting the first example from the validation set
@@ -313,9 +291,7 @@ if best_model_path and os.path.exists(best_model_path):
         plt.tight_layout()
         plt.show()
 
-        # --- Optional: Calculate overall validation metrics ---
-        # You can iterate through the dataloader to get all actuals and predictions
-        # if you want overall metrics like MAE/MSE for the point forecast.
+
         actuals_list = []
         predicted_list = []
         with torch.no_grad(): # Ensure no gradients are calculated
@@ -383,4 +359,4 @@ else:
     print("Could not find the best model checkpoint. Skipping prediction.")
 
 
-print("\nTransformer trainer script finished.") # Move this line to the very end
+print("\nTransformer trainer script finished.") 

@@ -9,7 +9,6 @@ from controllers.prediction_controller import PredictionController
 
 
 def main():
-    # Mode selection in the sidebar
     st.sidebar.title("Select Mode")
     mode = st.sidebar.radio("Which analysis do you want to perform?", options=["Analysis", "Prediction"])
 
