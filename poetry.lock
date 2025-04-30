@@ -1931,10 +1931,7 @@ files = [
 ]
 
 [package.dependencies]
-numpy = [
-    {version = ">=2.1.0", markers = "python_version >= \"3.13\""},
-    {version = ">=1.26.0", markers = "python_version == \"3.12\""},
-]
+numpy = {version = ">=1.26.0", markers = "python_version >= \"3.12\""}
 
 [package.extras]
 dev = ["absl-py", "pyink", "pylint (>=2.6.0)", "pytest", "pytest-xdist"]
@@ -4729,5 +4726,5 @@ repair = ["scipy (>=1.6.3)"]
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.12,<3.14"
-content-hash = "ba50777d68292724da03b8e392ac8437d886dd91df89803aa8e4f3ac14328401"
+python-versions = ">=3.12,<3.13"
+content-hash = "7686dae18a2283094be8d4584c0afd7ca22823f3d953844d429d2748514c3dbe"
