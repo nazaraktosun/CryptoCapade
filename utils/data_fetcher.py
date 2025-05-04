@@ -1,36 +1,36 @@
+# utils/data_fetcher.py
 import pandas as pd
 import numpy as np
-from datetime import datetime
 import yfinance as yf
 import time
-from yfinance.shared import YFRateLimitError
 import streamlit as st
-
-@st.cache_data(ttl=3600, persist="disk")
-def _download_crypto(
-    ticker: str,
-    start: str,
-    end: str
-) -> pd.DataFrame:
-    """Download OHLCV data for a ticker with retries on rate limit and cache for 1 hour."""
+from datetime import datetime
+@st.cache_data(ttl=24*3600, persist="disk")
+def _download_crypto(ticker: str, start: str, end: str) -> pd.DataFrame:
     for attempt in range(3):
         try:
-            df = yf.download(
+            return yf.download(
                 tickers=ticker,
                 start=start,
                 end=end,
-                progress=False
+                progress=False,
+                auto_adjust=True
             )
-            return df
-        except YFRateLimitError:
-            # exponential backoff
-            time.sleep(2 ** attempt)
-    # Final attempt (allow any error to bubble)
+        except Exception as e:
+            msg = str(e).lower()
+            if "rate limit" in msg or "too many requests" in msg:
+                # back off and retry
+                time.sleep(2 ** attempt)
+                continue
+            # some other error—bubble it up
+            raise
+    # final attempt (let any error bubble):
     return yf.download(
         tickers=ticker,
         start=start,
         end=end,
-        progress=False
+        progress=False,
+        auto_adjust=True
     )
 
 class DataFetcher:
