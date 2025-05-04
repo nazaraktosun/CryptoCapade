@@ -6,7 +6,7 @@ import time
 from yfinance.shared import YFRateLimitError
 import streamlit as st
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, persist="disk")
 def _download_crypto(
     ticker: str,
     start: str,
